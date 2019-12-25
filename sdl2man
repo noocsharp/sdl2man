@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+
+import re
+import time
+import argparse
+import os
+import stat
+from pathlib import Path
+import requests
+import subprocess
+import shutil
+
+epilog = """The generated man pages will be located at $XDG_DATA_HOME/sdl2man/man (usually .local/share/sdl2man/man). They can be installed by running the script in the sdl2man directory, or by adding the man directory to your MANPATH."""
+
+parser = argparse.ArgumentParser(epilog=epilog)
+
+default_args = {'fresh' : False, 'generate' : False, 'pull' : False, 'time_interval' : 10}
+
+download_group = parser.add_mutually_exclusive_group()
+download_group.add_argument('-p', '--pull', action='store_true', help='downloads updated copies of changed pages')
+download_group.add_argument('-f', '--fresh', action='store_true', help='removes local copies of pages and redownloads')
+parser.add_argument('-t', '--time-interval', action='store', default=10, help='sets time interval on page downloads in seconds (to avoid rate limiting), default is 10')
+parser.add_argument('-g', '--generate', action='store_true', help='generates manpages from local copies')
+args = parser.parse_args()
+
+if vars(args) == default_args:
+    parser.print_help()
+
+LOCAL = None
+try:
+    LOCAL = Path(os.environ['XDG_DATA_HOME']) / 'sdl2man'
+    LOCAL.mkdir(parents=True, exist_ok=True)
+except KeyError:
+    LOCAL = Path.home() / '.local' / 'share' / 'sdl2man'
+    LOCAL.mkdir(parents=True, exist_ok=True)
+
+
+root = "https://wiki.libsdl.org/"
+lastupdate_path = LOCAL / 'lastupdate'
+
+pages_path = LOCAL / 'pages'
+pages_path.mkdir(parents=True, exist_ok=True)
+
+man_path = LOCAL / 'man' / 'man3'
+man_path.mkdir(parents=True, exist_ok=True)
+
+install_path = Path('/usr/local/man/man3')
+
+script_text = """#!/bin/sh
+
+mkdir -p /usr/local/man/man3
+cp -r man/* {}
+""".format(install_path.as_posix())
+
+def retrieve_changed_pages():
+    #current time as formatted in the rss
+    lastupdate = None
+    if lastupdate_path.exists():
+        # gets rid of newline
+        content = lastupdate_path.read_text()[:-1]
+        if content:
+            try:
+                lastupdate = time.strptime(content, '%Y%m%d%H%M%S')
+            except ValueError as e:
+                raise Exception('lastupdate badly formatted') from e
+    else:
+        print("It appears as if the program hasn't been run before, run with -f instead to download a copy of the documentation.")
+        return
+
+    changed_pages = []
+    changes_page = requests.get(root + 'RecentChanges').text
+    for item in re.finditer('<rdf:li[^>]*?(SDL_[^\#]*)\#([0-9]*).*?></rdf:li>', changes_page, re.DOTALL):
+        page = item.group(1)
+        update_time = time.strptime(item.group(2), '%Y%m%d%H%M%S')
+
+        if lastupdate < updatetime:
+            changed_pages.append(page)
+
+    return changed_pages
+
+def download_pages(page_list):
+    for i, name in enumerate(page_list):
+        page = requests.get(root + name)
+        if '<h1>Surge protection</h1>' in page.text:
+            print('Rate limited')
+            break
+        print("{}/{}".format(i+1, len(pages)))
+        pages_path = pages_path / (name + '.html')
+        if not pages_path.exists():
+            pages_path.touch()
+
+        pages_path.write_text(page.text)
+
+        time.sleep(args.time_interval)
+    else:
+        lastupdate_path.write_text(time.strftime('%Y%m%d%H%M%S'))
+
+def retrieve_page_list():
+    api_page = requests.get(root + 'CategoryAPI')
+    pages = []
+
+    # isolates the different sections containing links
+    for section in re.finditer('searchresults">(.*)</div>', api_page.text, re.DOTALL):
+        # create a list of all of the names linked to
+        for item in re.finditer('href="/([_a-zA-Z]*)\?', section.group(0)):
+            pages.append(item.group(1))
+    
+    return pages
+
+def retrieve_local_page_list():
+    pages = []
+    for item in pages_path.iterdir():
+        pages.append(item.stem)
+
+    return pages
+
+# generates all man pages and install script
+def generate(pages):
+    for i, page in enumerate(pages):
+        path = pages_path / (page + '.html')
+        text = path.read_text()
+
+        man_text = html2man(page, text).encode('utf-8')
+
+        (man_path / (page + '.3')).write_bytes(man_text)
+
+        print('{}/{}'.format(i+1, len(pages)))
+
+    install_script = LOCAL / 'install_pages.sh'
+    install_script.write_text(script_text)
+    mode_flags = os.stat(install_script.as_posix()).st_mode | stat.S_IXUSR
+    os.chmod(install_script.as_posix(), mode_flags)
+
+# converts html from the SDL wiki into a man page
+def html2man(name, text):
+    # trims the large chunks of fat
+    text = re.sub(".*(?=<h1.*" + name + "</h1>)", '', text, count=1, flags=re.DOTALL)
+    text = re.sub("<script.*?</script>", '', text, flags=re.DOTALL)
+    text = re.sub("<hr.*", '', text, flags=re.DOTALL)
+
+    # trims out smaller, pervasive chunks of fat
+    text = re.sub("<span class=\"anchor\".*?</span>", '', text, flags=re.DOTALL)
+    text = re.sub("<p class=.*?>", '', text, flags=re.DOTALL)
+
+    # trim out very specific chunks of fat
+    text = re.sub("<div class=\"table-of-contents.*?</div>", '', text, flags=re.DOTALL)
+    text = re.sub("<span class=\"n\">(.*?)</span>", r'\1', text, flags=re.DOTALL)
+    
+    # replaces list of related structures at bottom of page with troff lists
+    text = re.sub("<li style=\"list-style-type:none\">(.*?) ?</li>", '\\1, ', text, flags=re.DOTALL)
+    text = re.sub("<ul>(.*?)</ul>", '\\1\n', text, flags=re.DOTALL)
+
+    # replaces html headers with troff headers
+    date = time.strftime('%Y-%m-%d')
+    text = re.sub("<h1 id=.*?>(.*?)</h1>", r'.TH \1 3 ' + date + ' "sdl2man" "SDLWiki"', text, flags=re.DOTALL)
+    text = re.sub("<h2 id=.*?>(.*?)</h2>", r'.SH \1', text, flags=re.DOTALL)
+
+    # handle tables
+    text = re.sub('<div><table><tbody>(.*?)</tbody></table></div>', '\n.TS\nallbox;\n\\1\n.TE\n', text, flags=re.DOTALL)
+
+    tables = re.findall('\.TS.*?\.TE', text, re.DOTALL)
+
+    row_lengths = []
+    for table in tables:
+        rows = int(len(re.findall('</?tr>', table))/2)
+        entries = int(len(re.findall('</?td>', table))/2)
+        row_lengths.append(int(entries / rows))
+
+    text = re.sub('<tr>(.*?)</tr>', '\\1', text, flags=re.DOTALL)
+    text = re.sub('<td>(.*?)</td>\n', 'T{\n\\1\nT}\t', text, flags=re.DOTALL)
+    text = re.sub(' *T{', 'T{', text)
+    text = re.sub('T}\t\n', 'T}\n', text)
+
+    for row_length in row_lengths:
+        text = re.sub('allbox;\nT{', 'allbox;\n' + 'l'*row_length + '.\nT{', text)
+
+    # handles code areas
+    text = re.sub('<div class="codearea".*?>.*?<pre.*?>(.*?)</pre></div>', '\\1', text, flags=re.DOTALL)
+    text = re.sub('<span class="line">(.*?)</span>', '\\1\n', text, flags=re.DOTALL)
+    text = re.sub('<span class="[a-z]*?">(.*?)</span>', '\\1', text)
+    text = re.sub('(?:<span class="[a-z]*?">)(.*?)\n(.*?)(?:</span>)', '\\1\\2', text, flags=re.DOTALL)
+    #gets rid of newlines which just separate single lines
+
+    # html formatting
+    text = re.sub('&quot;', '"', text)
+    text = re.sub('&amp;', '&', text)
+    #text = re.sub("<a href=\"/SDL_.*?\">(SDL_.*?)</a>", '\n.BR \\1\n', text, flags=re.DOTALL)
+    text = re.sub("<a href=.*?>(.*?)</a>", '\\1', text, flags=re.DOTALL)
+    text = re.sub("<strong>(.*?)</strong>", '\n.B \\1\n', text)
+
+    #spacing
+    #text = re.sub('\n[\n]+', '\n', text)
+    text = re.sub('\n\.TE', '.TE\n', text)
+    text = re.sub('\n\(\)([ .]?)', '()\\1\n', text)
+
+
+    # gets rid of any left over commas at the end of related objects
+    text = re.sub('(.SH Related.*?), \n', '\\1\n', text, flags=re.DOTALL)
+    #cleans up remaining html tags
+    text = re.sub('<(.*?).*?>(.*?)</\\1>', '\\2', text, flags=re.DOTALL)
+
+    return text
+
+pages = None
+if args.pull:
+    pages = retrieve_changed_pages()
+    print(pages)
+    download_pages(pages)
+
+if args.fresh:
+    pages = retrieve_page_list()
+    download_pages(pages)
+
+if args.generate:
+    if pages == None:
+        pages = retrieve_local_page_list()
+    generate(pages)
