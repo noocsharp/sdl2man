@@ -184,6 +184,8 @@ def html2man(name, text):
     # html formatting
     text = re.sub('&quot;', '"', text)
     text = re.sub('&amp;', '&', text)
+    text = re.sub('&lt;', '>', text)
+    text = re.sub('&gt;', '>', text)
     #text = re.sub("<a href=\"/SDL_.*?\">(SDL_.*?)</a>", '\n.BR \\1\n', text, flags=re.DOTALL)
     text = re.sub("<a href=.*?>(.*?)</a>", '\\1', text, flags=re.DOTALL)
     text = re.sub("<strong>(.*?)</strong>", '\n.B \\1\n', text)
