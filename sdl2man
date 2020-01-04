@@ -44,12 +44,12 @@ pages_path.mkdir(parents=True, exist_ok=True)
 man_path = LOCAL / 'man' / 'man3'
 man_path.mkdir(parents=True, exist_ok=True)
 
-install_path = Path('/usr/local/man/man3')
+install_path = Path('/usr/local/man')
 
 script_text = """#!/bin/sh
 
-mkdir -p /usr/local/man/man3
-cp -r man/* {}
+mkdir -p {0}/man3
+cp -r man/* {0}
 """.format(install_path.as_posix())
 
 def retrieve_changed_pages():
@@ -64,8 +64,11 @@ def retrieve_changed_pages():
             except ValueError as e:
                 raise Exception('lastupdate badly formatted') from e
     else:
-        print("It appears as if the program hasn't been run before, run with -f instead to download a copy of the documentation.")
-        return
+        #checks if the pages directory is empty
+        try:
+            pages_path.iterdir().__next__()
+        except StopIteration:
+            print("It appears as if the program hasn't been run before, run with -f instead to download a copy of the documentation.")
 
     changed_pages = []
     changes_page = requests.get(root + 'RecentChanges').text
@@ -84,12 +87,12 @@ def download_pages(page_list):
         if '<h1>Surge protection</h1>' in page.text:
             print('Rate limited')
             break
-        print("{}/{}".format(i+1, len(pages)))
-        pages_path = pages_path / (name + '.html')
-        if not pages_path.exists():
-            pages_path.touch()
+        print("{}/{}".format(i+1, len(page_list)))
+        page_path = pages_path / (name + '.html')
+        if not page_path.exists():
+            page_path.touch()
 
-        pages_path.write_text(page.text)
+        page_path.write_text(page.text)
 
         time.sleep(args.time_interval)
     else:
@@ -205,9 +208,14 @@ def html2man(name, text):
 
 pages = None
 if args.pull:
-    pages = retrieve_changed_pages()
-    print(pages)
-    download_pages(pages)
+    pages = retrieve_changed_pages() or []
+    all_pages = retrieve_page_list()
+    local_pages = retrieve_local_page_list()
+
+    # retrieves both pages that aren't on the computer and those that have changed
+    to_retrieve = [page for page in all_pages if page not in local_pages] + pages
+    
+    download_pages(to_retrieve)
 
 if args.fresh:
     pages = retrieve_page_list()
